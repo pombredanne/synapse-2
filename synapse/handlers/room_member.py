@@ -24,6 +24,7 @@ from synapse.api.constants import (
 )
 from synapse.api.errors import AuthError, SynapseError, Codes
 from synapse.util.logcontext import preserve_context_over_fn
+from synapse.util.caches.response_cache import ResponseCache
 
 from signedjson.sign import verify_signed_json
 from signedjson.key import decode_verify_key_bytes
@@ -59,6 +60,8 @@ class RoomMemberHandler(BaseHandler):
 
     def __init__(self, hs):
         super(RoomMemberHandler, self).__init__(hs)
+
+        self.join_cache = ResponseCache()
 
         self.clock = hs.get_clock()
 
@@ -171,8 +174,45 @@ class RoomMemberHandler(BaseHandler):
             user_id
         )
 
-    @defer.inlineCallbacks
     def update_membership(
+            self,
+            requester,
+            target,
+            room_id,
+            action,
+            txn_id=None,
+            remote_room_hosts=None,
+            third_party_signed=None,
+            ratelimit=True,
+    ):
+        if action == Membership.JOIN:
+            result = self.join_cache.get((room_id, target))
+            if not result:
+                result = self.join_cache.set((room_id, target), self._update_membership(
+                    requester,
+                    target,
+                    room_id,
+                    action,
+                    txn_id=txn_id,
+                    remote_room_hosts=remote_room_hosts,
+                    third_party_signed=third_party_signed,
+                    ratelimit=ratelimit,
+                ))
+            return result
+        else:
+            return self._update_membership(
+                requester,
+                target,
+                room_id,
+                action,
+                txn_id=txn_id,
+                remote_room_hosts=remote_room_hosts,
+                third_party_signed=third_party_signed,
+                ratelimit=ratelimit,
+            )
+
+    @defer.inlineCallbacks
+    def _update_membership(
             self,
             requester,
             target,
