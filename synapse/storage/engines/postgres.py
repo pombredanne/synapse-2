@@ -13,18 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from synapse.storage.prepare_database import prepare_database
-
 from ._base import IncorrectDatabaseSetup
 
 
 class PostgresEngine(object):
     single_threaded = False
 
-    def __init__(self, database_module, config):
+    def __init__(self, database_module, database_config):
         self.module = database_module
         self.module.extensions.register_type(self.module.extensions.UNICODE)
-        self.config = config
+        self.synchronous_commit = database_config.get("synchronous_commit", True)
 
     def check_database(self, txn):
         txn.execute("SHOW SERVER_ENCODING")
@@ -43,12 +41,19 @@ class PostgresEngine(object):
         db_conn.set_isolation_level(
             self.module.extensions.ISOLATION_LEVEL_REPEATABLE_READ
         )
-
-    def prepare_database(self, db_conn):
-        prepare_database(db_conn, self, config=self.config)
+        # Asynchronous commit, don't wait for the server to call fsync before
+        # ending the transaction.
+        # https://www.postgresql.org/docs/current/static/wal-async-commit.html
+        if not self.synchronous_commit:
+            cursor = db_conn.cursor()
+            cursor.execute("SET synchronous_commit TO OFF")
+            cursor.close()
 
     def is_deadlock(self, error):
         if isinstance(error, self.module.DatabaseError):
+            # https://www.postgresql.org/docs/current/static/errcodes-appendix.html
+            # "40001" serialization_failure
+            # "40P01" deadlock_detected
             return error.pgcode in ["40001", "40P01"]
         return False
 

@@ -13,15 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from synapse.replication.resource import ReplicationResource
-from synapse.types import Requester, UserID
-
-from twisted.internet import defer
-from tests import unittest
-from tests.utils import setup_test_homeserver, requester_for_user
-from mock import Mock, NonCallableMock
-import json
 import contextlib
+import json
+
+from mock import Mock, NonCallableMock
+from twisted.internet import defer
+
+import synapse.types
+from synapse.replication.resource import ReplicationResource
+from synapse.types import UserID
+from tests import unittest
+from tests.utils import setup_test_homeserver
 
 
 class ReplicationResourceCase(unittest.TestCase):
@@ -58,21 +60,27 @@ class ReplicationResourceCase(unittest.TestCase):
         self.assertEquals(body, {})
 
     @defer.inlineCallbacks
-    def test_events(self):
-        get = self.get(events="-1", timeout="0")
+    def test_events_and_state(self):
+        get = self.get(events="-1", state="-1", timeout="0")
         yield self.hs.get_handlers().room_creation_handler.create_room(
-            Requester(self.user, "", False), {}
+            synapse.types.create_requester(self.user), {}
         )
         code, body = yield get
         self.assertEquals(code, 200)
         self.assertEquals(body["events"]["field_names"], [
-            "position", "internal", "json"
+            "position", "internal", "json", "state_group"
+        ])
+        self.assertEquals(body["state_groups"]["field_names"], [
+            "position", "room_id", "event_id"
+        ])
+        self.assertEquals(body["state_group_state"]["field_names"], [
+            "position", "type", "state_key", "event_id"
         ])
 
     @defer.inlineCallbacks
     def test_presence(self):
         get = self.get(presence="-1")
-        yield self.hs.get_handlers().presence_handler.set_state(
+        yield self.hs.get_presence_handler().set_state(
             self.user, {"presence": "online"}
         )
         code, body = yield get
@@ -87,7 +95,7 @@ class ReplicationResourceCase(unittest.TestCase):
     def test_typing(self):
         room_id = yield self.create_room()
         get = self.get(typing="-1")
-        yield self.hs.get_handlers().typing_notification_handler.started_typing(
+        yield self.hs.get_typing_handler().started_typing(
             self.user, self.user, room_id, timeout=2
         )
         code, body = yield get
@@ -132,12 +140,13 @@ class ReplicationResourceCase(unittest.TestCase):
     test_timeout_backfill = _test_timeout("backfill")
     test_timeout_push_rules = _test_timeout("push_rules")
     test_timeout_pushers = _test_timeout("pushers")
+    test_timeout_state = _test_timeout("state")
 
     @defer.inlineCallbacks
     def send_text_message(self, room_id, message):
         handler = self.hs.get_handlers().message_handler
         event = yield handler.create_and_send_nonmember_event(
-            requester_for_user(self.user),
+            synapse.types.create_requester(self.user),
             {
                 "type": "m.room.message",
                 "content": {"body": "message", "msgtype": "m.text"},
@@ -150,7 +159,7 @@ class ReplicationResourceCase(unittest.TestCase):
     @defer.inlineCallbacks
     def create_room(self):
         result = yield self.hs.get_handlers().room_creation_handler.create_room(
-            Requester(self.user, "", False), {}
+            synapse.types.create_requester(self.user), {}
         )
         defer.returnValue(result["room_id"])
 
@@ -182,4 +191,21 @@ class ReplicationResourceCase(unittest.TestCase):
         )
         response_body = json.loads(response_json)
 
+        if response_code == 200:
+            self.check_response(response_body)
+
         defer.returnValue((response_code, response_body))
+
+    def check_response(self, response_body):
+        for name, stream in response_body.items():
+            self.assertIn("field_names", stream)
+            field_names = stream["field_names"]
+            self.assertIn("rows", stream)
+            self.assertTrue(stream["rows"])
+            for row in stream["rows"]:
+                self.assertEquals(
+                    len(row), len(field_names),
+                    "%s: len(row = %r) == len(field_names = %r)" % (
+                        name, row, field_names
+                    )
+                )

@@ -44,6 +44,9 @@ from synapse.rest.client.v2_alpha import (
     tokenrefresh,
     tags,
     account_data,
+    report_event,
+    openid,
+    devices,
 )
 
 from synapse.http.server import JsonResource
@@ -86,3 +89,6 @@ class ClientRestResource(JsonResource):
         tokenrefresh.register_servlets(hs, client_resource)
         tags.register_servlets(hs, client_resource)
         account_data.register_servlets(hs, client_resource)
+        report_event.register_servlets(hs, client_resource)
+        openid.register_servlets(hs, client_resource)
+        devices.register_servlets(hs, client_resource)

@@ -18,11 +18,11 @@ from twisted.internet import defer
 from synapse.api.errors import StoreError
 
 from ._base import SQLBaseStore
-from synapse.util.caches.descriptors import cachedInlineCallbacks
 from .engines import PostgresEngine, Sqlite3Engine
 
 import collections
 import logging
+import ujson as json
 
 logger = logging.getLogger(__name__)
 
@@ -169,47 +169,41 @@ class RoomStore(SQLBaseStore):
     def _store_event_search_txn(self, txn, event, key, value):
         if isinstance(self.database_engine, PostgresEngine):
             sql = (
-                "INSERT INTO event_search (event_id, room_id, key, vector)"
-                " VALUES (?,?,?,to_tsvector('english', ?))"
+                "INSERT INTO event_search"
+                " (event_id, room_id, key, vector, stream_ordering, origin_server_ts)"
+                " VALUES (?,?,?,to_tsvector('english', ?),?,?)"
+            )
+            txn.execute(
+                sql,
+                (
+                    event.event_id, event.room_id, key, value,
+                    event.internal_metadata.stream_ordering,
+                    event.origin_server_ts,
+                )
             )
         elif isinstance(self.database_engine, Sqlite3Engine):
             sql = (
                 "INSERT INTO event_search (event_id, room_id, key, value)"
                 " VALUES (?,?,?,?)"
             )
+            txn.execute(sql, (event.event_id, event.room_id, key, value,))
         else:
             # This should be unreachable.
             raise Exception("Unrecognized database engine")
 
-        txn.execute(sql, (event.event_id, event.room_id, key, value,))
-
-    @cachedInlineCallbacks()
-    def get_room_name_and_aliases(self, room_id):
-        def f(txn):
-            sql = (
-                "SELECT event_id FROM current_state_events "
-                "WHERE room_id = ? "
-            )
-
-            sql += " AND ((type = 'm.room.name' AND state_key = '')"
-            sql += " OR type = 'm.room.aliases')"
-
-            txn.execute(sql, (room_id,))
-            results = self.cursor_to_dict(txn)
-
-            return self._parse_events_txn(txn, results)
-
-        events = yield self.runInteraction("get_room_name_and_aliases", f)
-
-        name = None
-        aliases = []
-
-        for e in events:
-            if e.type == 'm.room.name':
-                if 'name' in e.content:
-                    name = e.content['name']
-            elif e.type == 'm.room.aliases':
-                if 'aliases' in e.content:
-                    aliases.extend(e.content['aliases'])
-
-        defer.returnValue((name, aliases))
+    def add_event_report(self, room_id, event_id, user_id, reason, content,
+                         received_ts):
+        next_id = self._event_reports_id_gen.get_next()
+        return self._simple_insert(
+            table="event_reports",
+            values={
+                "id": next_id,
+                "received_ts": received_ts,
+                "room_id": room_id,
+                "event_id": event_id,
+                "user_id": user_id,
+                "reason": reason,
+                "content": json.dumps(content),
+            },
+            desc="add_event_report"
+        )

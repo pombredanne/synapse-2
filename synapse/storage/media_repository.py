@@ -25,7 +25,7 @@ class MediaRepositoryStore(SQLBaseStore):
     def get_local_media(self, media_id):
         """Get the metadata for a local piece of media
         Returns:
-            None if the meia_id doesn't exist.
+            None if the media_id doesn't exist.
         """
         return self._simple_select_one(
             "local_media_repository",
@@ -48,6 +48,61 @@ class MediaRepositoryStore(SQLBaseStore):
                 "user_id": user_id.to_string(),
             },
             desc="store_local_media",
+        )
+
+    def get_url_cache(self, url, ts):
+        """Get the media_id and ts for a cached URL as of the given timestamp
+        Returns:
+            None if the URL isn't cached.
+        """
+        def get_url_cache_txn(txn):
+            # get the most recently cached result (relative to the given ts)
+            sql = (
+                "SELECT response_code, etag, expires, og, media_id, download_ts"
+                " FROM local_media_repository_url_cache"
+                " WHERE url = ? AND download_ts <= ?"
+                " ORDER BY download_ts DESC LIMIT 1"
+            )
+            txn.execute(sql, (url, ts))
+            row = txn.fetchone()
+
+            if not row:
+                # ...or if we've requested a timestamp older than the oldest
+                # copy in the cache, return the oldest copy (if any)
+                sql = (
+                    "SELECT response_code, etag, expires, og, media_id, download_ts"
+                    " FROM local_media_repository_url_cache"
+                    " WHERE url = ? AND download_ts > ?"
+                    " ORDER BY download_ts ASC LIMIT 1"
+                )
+                txn.execute(sql, (url, ts))
+                row = txn.fetchone()
+
+            if not row:
+                return None
+
+            return dict(zip((
+                'response_code', 'etag', 'expires', 'og', 'media_id', 'download_ts'
+            ), row))
+
+        return self.runInteraction(
+            "get_url_cache", get_url_cache_txn
+        )
+
+    def store_url_cache(self, url, response_code, etag, expires, og, media_id,
+                        download_ts):
+        return self._simple_insert(
+            "local_media_repository_url_cache",
+            {
+                "url": url,
+                "response_code": response_code,
+                "etag": etag,
+                "expires": expires,
+                "og": og,
+                "media_id": media_id,
+                "download_ts": download_ts,
+            },
+            desc="store_url_cache",
         )
 
     def get_local_media_thumbnails(self, media_id):
@@ -102,9 +157,24 @@ class MediaRepositoryStore(SQLBaseStore):
                 "created_ts": time_now_ms,
                 "upload_name": upload_name,
                 "filesystem_id": filesystem_id,
+                "last_access_ts": time_now_ms,
             },
             desc="store_cached_remote_media",
         )
+
+    def update_cached_last_access_time(self, origin_id_tuples, time_ts):
+        def update_cache_txn(txn):
+            sql = (
+                "UPDATE remote_media_cache SET last_access_ts = ?"
+                " WHERE media_origin = ? AND media_id = ?"
+            )
+
+            txn.executemany(sql, (
+                (time_ts, media_origin, media_id)
+                for media_origin, media_id in origin_id_tuples
+            ))
+
+        return self.runInteraction("update_cached_last_access_time", update_cache_txn)
 
     def get_remote_media_thumbnails(self, origin, media_id):
         return self._simple_select_list(
@@ -135,3 +205,32 @@ class MediaRepositoryStore(SQLBaseStore):
             },
             desc="store_remote_media_thumbnail",
         )
+
+    def get_remote_media_before(self, before_ts):
+        sql = (
+            "SELECT media_origin, media_id, filesystem_id"
+            " FROM remote_media_cache"
+            " WHERE last_access_ts < ?"
+        )
+
+        return self._execute(
+            "get_remote_media_before", self.cursor_to_dict, sql, before_ts
+        )
+
+    def delete_remote_media(self, media_origin, media_id):
+        def delete_remote_media_txn(txn):
+            self._simple_delete_txn(
+                txn,
+                "remote_media_cache",
+                keyvalues={
+                    "media_origin": media_origin, "media_id": media_id
+                },
+            )
+            self._simple_delete_txn(
+                txn,
+                "remote_media_cache_thumbnails",
+                keyvalues={
+                    "media_origin": media_origin, "media_id": media_id
+                },
+            )
+        return self.runInteraction("delete_remote_media", delete_remote_media_txn)

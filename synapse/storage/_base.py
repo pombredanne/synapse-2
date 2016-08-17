@@ -152,8 +152,8 @@ class SQLBaseStore(object):
 
     def __init__(self, hs):
         self.hs = hs
-        self._db_pool = hs.get_db_pool()
         self._clock = hs.get_clock()
+        self._db_pool = hs.get_db_pool()
 
         self._previous_txn_total_time = 0
         self._current_txn_total_time = 0
@@ -453,7 +453,9 @@ class SQLBaseStore(object):
             keyvalues (dict): The unique key tables and their new values
             values (dict): The nonunique columns and their new values
             insertion_values (dict): key/values to use when inserting
-        Returns: A deferred
+        Returns:
+            Deferred(bool): True if a new entry was created, False if an
+                existing one was updated.
         """
         return self.runInteraction(
             desc,
@@ -497,6 +499,10 @@ class SQLBaseStore(object):
                 sql, keyvalues.values(),
             )
             txn.execute(sql, allvalues.values())
+
+            return True
+        else:
+            return False
 
     def _simple_select_one(self, table, keyvalues, retcols,
                            allow_none=False, desc="_simple_select_one"):
@@ -591,10 +597,13 @@ class SQLBaseStore(object):
         more rows, returning the result as a list of dicts.
 
         Args:
-            table : string giving the table name
-            keyvalues : dict of column names and values to select the rows with,
-            or None to not apply a WHERE clause.
-            retcols : list of strings giving the names of the columns to return
+            table (str): the table name
+            keyvalues (dict[str, Any] | None):
+                column names and values to select the rows with, or None to not
+                apply a WHERE clause.
+            retcols (iterable[str]): the names of the columns to return
+        Returns:
+            defer.Deferred: resolves to list[dict[str, Any]]
         """
         return self.runInteraction(
             desc,
@@ -609,9 +618,11 @@ class SQLBaseStore(object):
 
         Args:
             txn : Transaction object
-            table : string giving the table name
-            keyvalues : dict of column names and values to select the rows with
-            retcols : list of strings giving the names of the columns to return
+            table (str): the table name
+            keyvalues (dict[str, T] | None):
+                column names and values to select the rows with, or None to not
+                apply a WHERE clause.
+            retcols (iterable[str]): the names of the columns to return
         """
         if keyvalues:
             sql = "SELECT %s FROM %s WHERE %s" % (
@@ -801,6 +812,11 @@ class SQLBaseStore(object):
         if txn.rowcount > 1:
             raise StoreError(500, "more than one row matched")
 
+    def _simple_delete(self, table, keyvalues, desc):
+        return self.runInteraction(
+            desc, self._simple_delete_txn, table, keyvalues
+        )
+
     @staticmethod
     def _simple_delete_txn(txn, table, keyvalues):
         sql = "DELETE FROM %s WHERE %s" % (
@@ -810,11 +826,39 @@ class SQLBaseStore(object):
 
         return txn.execute(sql, keyvalues.values())
 
-    def get_next_stream_id(self):
-        with self._next_stream_id_lock:
-            i = self._next_stream_id
-            self._next_stream_id += 1
-            return i
+    def _get_cache_dict(self, db_conn, table, entity_column, stream_column,
+                        max_value):
+        # Fetch a mapping of room_id -> max stream position for "recent" rooms.
+        # It doesn't really matter how many we get, the StreamChangeCache will
+        # do the right thing to ensure it respects the max size of cache.
+        sql = (
+            "SELECT %(entity)s, MAX(%(stream)s) FROM %(table)s"
+            " WHERE %(stream)s > ? - 100000"
+            " GROUP BY %(entity)s"
+        ) % {
+            "table": table,
+            "entity": entity_column,
+            "stream": stream_column,
+        }
+
+        sql = self.database_engine.convert_param_style(sql)
+
+        txn = db_conn.cursor()
+        txn.execute(sql, (int(max_value),))
+        rows = txn.fetchall()
+        txn.close()
+
+        cache = {
+            row[0]: int(row[1])
+            for row in rows
+        }
+
+        if cache:
+            min_val = min(cache.values())
+        else:
+            min_val = max_value
+
+        return cache, min_val
 
 
 class _RollbackButIsFineException(Exception):

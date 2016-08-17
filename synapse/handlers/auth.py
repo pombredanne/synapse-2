@@ -18,8 +18,9 @@ from twisted.internet import defer
 from ._base import BaseHandler
 from synapse.api.constants import LoginType
 from synapse.types import UserID
-from synapse.api.errors import AuthError, LoginError, Codes
+from synapse.api.errors import AuthError, LoginError, Codes, StoreError, SynapseError
 from synapse.util.async import run_on_reactor
+from synapse.config.ldap import LDAPMode
 
 from twisted.web.client import PartialDownloadError
 
@@ -27,6 +28,12 @@ import logging
 import bcrypt
 import pymacaroons
 import simplejson
+
+try:
+    import ldap3
+except ImportError:
+    ldap3 = None
+    pass
 
 import synapse.util.stringutils as stringutils
 
@@ -38,6 +45,10 @@ class AuthHandler(BaseHandler):
     SESSION_EXPIRE_MS = 48 * 60 * 60 * 1000
 
     def __init__(self, hs):
+        """
+        Args:
+            hs (synapse.server.HomeServer):
+        """
         super(AuthHandler, self).__init__(hs)
         self.checkers = {
             LoginType.PASSWORD: self._check_password_auth,
@@ -48,6 +59,25 @@ class AuthHandler(BaseHandler):
         self.bcrypt_rounds = hs.config.bcrypt_rounds
         self.sessions = {}
         self.INVALID_TOKEN_HTTP_STATUS = 401
+
+        self.ldap_enabled = hs.config.ldap_enabled
+        if self.ldap_enabled:
+            if not ldap3:
+                raise RuntimeError(
+                    'Missing ldap3 library. This is required for LDAP Authentication.'
+                )
+            self.ldap_mode = hs.config.ldap_mode
+            self.ldap_uri = hs.config.ldap_uri
+            self.ldap_start_tls = hs.config.ldap_start_tls
+            self.ldap_base = hs.config.ldap_base
+            self.ldap_filter = hs.config.ldap_filter
+            self.ldap_attributes = hs.config.ldap_attributes
+            if self.ldap_mode == LDAPMode.SEARCH:
+                self.ldap_bind_dn = hs.config.ldap_bind_dn
+                self.ldap_bind_password = hs.config.ldap_bind_password
+
+        self.hs = hs  # FIXME better possibility to access registrationHandler later?
+        self.device_handler = hs.get_device_handler()
 
     @defer.inlineCallbacks
     def check_auth(self, flows, clientdict, clientip):
@@ -163,9 +193,13 @@ class AuthHandler(BaseHandler):
     def get_session_id(self, clientdict):
         """
         Gets the session ID for a client given the client dictionary
-        :param clientdict: The dictionary sent by the client in the request
-        :return: The string session ID the client sent. If the client did not
-                 send a session ID, returns None.
+
+        Args:
+            clientdict: The dictionary sent by the client in the request
+
+        Returns:
+            str|None: The string session ID the client sent. If the client did
+                not send a session ID, returns None.
         """
         sid = None
         if clientdict and 'auth' in clientdict:
@@ -179,9 +213,11 @@ class AuthHandler(BaseHandler):
         Store a key-value pair into the sessions data associated with this
         request. This data is stored server-side and cannot be modified by
         the client.
-        :param session_id: (string) The ID of this session as returned from check_auth
-        :param key: (string) The key to store the data under
-        :param value: (any) The data to store
+
+        Args:
+            session_id (string): The ID of this session as returned from check_auth
+            key (string): The key to store the data under
+            value (any): The data to store
         """
         sess = self._get_session_info(session_id)
         sess.setdefault('serverdict', {})[key] = value
@@ -190,14 +226,15 @@ class AuthHandler(BaseHandler):
     def get_session_data(self, session_id, key, default=None):
         """
         Retrieve data stored with set_session_data
-        :param session_id: (string) The ID of this session as returned from check_auth
-        :param key: (string) The key to store the data under
-        :param default: (any) Value to return if the key has not been set
+
+        Args:
+            session_id (string): The ID of this session as returned from check_auth
+            key (string): The key to store the data under
+            default (any): Value to return if the key has not been set
         """
         sess = self._get_session_info(session_id)
         return sess.setdefault('serverdict', {}).get(key, default)
 
-    @defer.inlineCallbacks
     def _check_password_auth(self, authdict, _):
         if "user" not in authdict or "password" not in authdict:
             raise LoginError(400, "", Codes.MISSING_PARAM)
@@ -207,9 +244,7 @@ class AuthHandler(BaseHandler):
         if not user_id.startswith('@'):
             user_id = UserID.create(user_id, self.hs.hostname).to_string()
 
-        user_id, password_hash = yield self._find_user_id_and_pwd_hash(user_id)
-        self._check_password(user_id, password, password_hash)
-        defer.returnValue(user_id)
+        return self._check_password(user_id, password)
 
     @defer.inlineCallbacks
     def _check_recaptcha(self, authdict, clientip):
@@ -245,8 +280,17 @@ class AuthHandler(BaseHandler):
             data = pde.response
             resp_body = simplejson.loads(data)
 
-        if 'success' in resp_body and resp_body['success']:
-            defer.returnValue(True)
+        if 'success' in resp_body:
+            # Note that we do NOT check the hostname here: we explicitly
+            # intend the CAPTCHA to be presented by whatever client the
+            # user is using, we just care that they have completed a CAPTCHA.
+            logger.info(
+                "%s reCAPTCHA from hostname %s",
+                "Successful" if resp_body['success'] else "Failed",
+                resp_body.get('hostname')
+            )
+            if resp_body['success']:
+                defer.returnValue(True)
         raise LoginError(401, "", errcode=Codes.UNAUTHORIZED)
 
     @defer.inlineCallbacks
@@ -313,65 +357,84 @@ class AuthHandler(BaseHandler):
 
         return self.sessions[session_id]
 
-    @defer.inlineCallbacks
-    def login_with_password(self, user_id, password):
+    def validate_password_login(self, user_id, password):
         """
         Authenticates the user with their username and password.
 
         Used only by the v1 login API.
 
         Args:
-            user_id (str): User ID
+            user_id (str): complete @user:id
             password (str): Password
         Returns:
-            A tuple of:
-              The user's ID.
-              The access token for the user's session.
-              The refresh token for the user's session.
+            defer.Deferred: (str) canonical user id
         Raises:
-            StoreError if there was a problem storing the token.
+            StoreError if there was a problem accessing the database
             LoginError if there was an authentication problem.
         """
-        user_id, password_hash = yield self._find_user_id_and_pwd_hash(user_id)
-        self._check_password(user_id, password, password_hash)
-
-        logger.info("Logging in user %s", user_id)
-        access_token = yield self.issue_access_token(user_id)
-        refresh_token = yield self.issue_refresh_token(user_id)
-        defer.returnValue((user_id, access_token, refresh_token))
+        return self._check_password(user_id, password)
 
     @defer.inlineCallbacks
-    def get_login_tuple_for_user_id(self, user_id):
+    def get_login_tuple_for_user_id(self, user_id, device_id=None,
+                                    initial_display_name=None):
         """
         Gets login tuple for the user with the given user ID.
+
+        Creates a new access/refresh token for the user.
+
         The user is assumed to have been authenticated by some other
-        machanism (e.g. CAS)
+        machanism (e.g. CAS), and the user_id converted to the canonical case.
+
+        The device will be recorded in the table if it is not there already.
 
         Args:
-            user_id (str): User ID
+            user_id (str): canonical User ID
+            device_id (str|None): the device ID to associate with the tokens.
+               None to leave the tokens unassociated with a device (deprecated:
+               we should always have a device ID)
+            initial_display_name (str): display name to associate with the
+               device if it needs re-registering
         Returns:
             A tuple of:
-              The user's ID.
               The access token for the user's session.
               The refresh token for the user's session.
         Raises:
             StoreError if there was a problem storing the token.
             LoginError if there was an authentication problem.
         """
-        user_id, ignored = yield self._find_user_id_and_pwd_hash(user_id)
+        logger.info("Logging in user %s on device %s", user_id, device_id)
+        access_token = yield self.issue_access_token(user_id, device_id)
+        refresh_token = yield self.issue_refresh_token(user_id, device_id)
 
-        logger.info("Logging in user %s", user_id)
-        access_token = yield self.issue_access_token(user_id)
-        refresh_token = yield self.issue_refresh_token(user_id)
-        defer.returnValue((user_id, access_token, refresh_token))
+        # the device *should* have been registered before we got here; however,
+        # it's possible we raced against a DELETE operation. The thing we
+        # really don't want is active access_tokens without a record of the
+        # device, so we double-check it here.
+        if device_id is not None:
+            yield self.device_handler.check_device_registered(
+                user_id, device_id, initial_display_name
+            )
+
+        defer.returnValue((access_token, refresh_token))
 
     @defer.inlineCallbacks
-    def does_user_exist(self, user_id):
+    def check_user_exists(self, user_id):
+        """
+        Checks to see if a user with the given id exists. Will check case
+        insensitively, but return None if there are multiple inexact matches.
+
+        Args:
+            (str) user_id: complete @user:id
+
+        Returns:
+            defer.Deferred: (str) canonical_user_id, or None if zero or
+            multiple matches
+        """
         try:
-            yield self._find_user_id_and_pwd_hash(user_id)
-            defer.returnValue(True)
+            res = yield self._find_user_id_and_pwd_hash(user_id)
+            defer.returnValue(res[0])
         except LoginError:
-            defer.returnValue(False)
+            defer.returnValue(None)
 
     @defer.inlineCallbacks
     def _find_user_id_and_pwd_hash(self, user_id):
@@ -399,30 +462,234 @@ class AuthHandler(BaseHandler):
         else:
             defer.returnValue(user_infos.popitem())
 
-    def _check_password(self, user_id, password, stored_hash):
-        """Checks that user_id has passed password, raises LoginError if not."""
-        if not self.validate_hash(password, stored_hash):
-            logger.warn("Failed password login for user %s", user_id)
-            raise LoginError(403, "", errcode=Codes.FORBIDDEN)
+    @defer.inlineCallbacks
+    def _check_password(self, user_id, password):
+        """Authenticate a user against the LDAP and local databases.
+
+        user_id is checked case insensitively against the local database, but
+        will throw if there are multiple inexact matches.
+
+        Args:
+            user_id (str): complete @user:id
+        Returns:
+            (str) the canonical_user_id
+        Raises:
+            LoginError if the password was incorrect
+        """
+        valid_ldap = yield self._check_ldap_password(user_id, password)
+        if valid_ldap:
+            defer.returnValue(user_id)
+
+        result = yield self._check_local_password(user_id, password)
+        defer.returnValue(result)
 
     @defer.inlineCallbacks
-    def issue_access_token(self, user_id):
+    def _check_local_password(self, user_id, password):
+        """Authenticate a user against the local password database.
+
+        user_id is checked case insensitively, but will throw if there are
+        multiple inexact matches.
+
+        Args:
+            user_id (str): complete @user:id
+        Returns:
+            (str) the canonical_user_id
+        Raises:
+            LoginError if the password was incorrect
+        """
+        user_id, password_hash = yield self._find_user_id_and_pwd_hash(user_id)
+        result = self.validate_hash(password, password_hash)
+        if not result:
+            logger.warn("Failed password login for user %s", user_id)
+            raise LoginError(403, "", errcode=Codes.FORBIDDEN)
+        defer.returnValue(user_id)
+
+    @defer.inlineCallbacks
+    def _check_ldap_password(self, user_id, password):
+        """ Attempt to authenticate a user against an LDAP Server
+            and register an account if none exists.
+
+            Returns:
+                True if authentication against LDAP was successful
+        """
+
+        if not ldap3 or not self.ldap_enabled:
+            defer.returnValue(False)
+
+        if self.ldap_mode not in LDAPMode.LIST:
+            raise RuntimeError(
+                'Invalid ldap mode specified: {mode}'.format(
+                    mode=self.ldap_mode
+                )
+            )
+
+        try:
+            server = ldap3.Server(self.ldap_uri)
+            logger.debug(
+                "Attempting ldap connection with %s",
+                self.ldap_uri
+            )
+
+            localpart = UserID.from_string(user_id).localpart
+            if self.ldap_mode == LDAPMode.SIMPLE:
+                # bind with the the local users ldap credentials
+                bind_dn = "{prop}={value},{base}".format(
+                    prop=self.ldap_attributes['uid'],
+                    value=localpart,
+                    base=self.ldap_base
+                )
+                conn = ldap3.Connection(server, bind_dn, password)
+                logger.debug(
+                    "Established ldap connection in simple mode: %s",
+                    conn
+                )
+
+                if self.ldap_start_tls:
+                    conn.start_tls()
+                    logger.debug(
+                        "Upgraded ldap connection in simple mode through StartTLS: %s",
+                        conn
+                    )
+
+                conn.bind()
+
+            elif self.ldap_mode == LDAPMode.SEARCH:
+                # connect with preconfigured credentials and search for local user
+                conn = ldap3.Connection(
+                    server,
+                    self.ldap_bind_dn,
+                    self.ldap_bind_password
+                )
+                logger.debug(
+                    "Established ldap connection in search mode: %s",
+                    conn
+                )
+
+                if self.ldap_start_tls:
+                    conn.start_tls()
+                    logger.debug(
+                        "Upgraded ldap connection in search mode through StartTLS: %s",
+                        conn
+                    )
+
+                conn.bind()
+
+                # find matching dn
+                query = "({prop}={value})".format(
+                    prop=self.ldap_attributes['uid'],
+                    value=localpart
+                )
+                if self.ldap_filter:
+                    query = "(&{query}{filter})".format(
+                        query=query,
+                        filter=self.ldap_filter
+                    )
+                logger.debug("ldap search filter: %s", query)
+                result = conn.search(self.ldap_base, query)
+
+                if result and len(conn.response) == 1:
+                    # found exactly one result
+                    user_dn = conn.response[0]['dn']
+                    logger.debug('ldap search found dn: %s', user_dn)
+
+                    # unbind and reconnect, rebind with found dn
+                    conn.unbind()
+                    conn = ldap3.Connection(
+                        server,
+                        user_dn,
+                        password,
+                        auto_bind=True
+                    )
+                else:
+                    # found 0 or > 1 results, abort!
+                    logger.warn(
+                        "ldap search returned unexpected (%d!=1) amount of results",
+                        len(conn.response)
+                    )
+                    defer.returnValue(False)
+
+            logger.info(
+                "User authenticated against ldap server: %s",
+                conn
+            )
+
+            # check for existing account, if none exists, create one
+            if not (yield self.check_user_exists(user_id)):
+                # query user metadata for account creation
+                query = "({prop}={value})".format(
+                    prop=self.ldap_attributes['uid'],
+                    value=localpart
+                )
+
+                if self.ldap_mode == LDAPMode.SEARCH and self.ldap_filter:
+                    query = "(&{filter}{user_filter})".format(
+                        filter=query,
+                        user_filter=self.ldap_filter
+                    )
+                logger.debug("ldap registration filter: %s", query)
+
+                result = conn.search(
+                    search_base=self.ldap_base,
+                    search_filter=query,
+                    attributes=[
+                        self.ldap_attributes['name'],
+                        self.ldap_attributes['mail']
+                    ]
+                )
+
+                if len(conn.response) == 1:
+                    attrs = conn.response[0]['attributes']
+                    mail = attrs[self.ldap_attributes['mail']][0]
+                    name = attrs[self.ldap_attributes['name']][0]
+
+                    # create account
+                    registration_handler = self.hs.get_handlers().registration_handler
+                    user_id, access_token = (
+                        yield registration_handler.register(localpart=localpart)
+                    )
+
+                    # TODO: bind email, set displayname with data from ldap directory
+
+                    logger.info(
+                        "ldap registration successful: %d: %s (%s, %)",
+                        user_id,
+                        localpart,
+                        name,
+                        mail
+                    )
+                else:
+                    logger.warn(
+                        "ldap registration failed: unexpected (%d!=1) amount of results",
+                        len(result)
+                    )
+                    defer.returnValue(False)
+
+            defer.returnValue(True)
+        except ldap3.core.exceptions.LDAPException as e:
+            logger.warn("Error during ldap authentication: %s", e)
+            defer.returnValue(False)
+
+    @defer.inlineCallbacks
+    def issue_access_token(self, user_id, device_id=None):
         access_token = self.generate_access_token(user_id)
-        yield self.store.add_access_token_to_user(user_id, access_token)
+        yield self.store.add_access_token_to_user(user_id, access_token,
+                                                  device_id)
         defer.returnValue(access_token)
 
     @defer.inlineCallbacks
-    def issue_refresh_token(self, user_id):
+    def issue_refresh_token(self, user_id, device_id=None):
         refresh_token = self.generate_refresh_token(user_id)
-        yield self.store.add_refresh_token_to_user(user_id, refresh_token)
+        yield self.store.add_refresh_token_to_user(user_id, refresh_token,
+                                                   device_id)
         defer.returnValue(refresh_token)
 
-    def generate_access_token(self, user_id, extra_caveats=None):
+    def generate_access_token(self, user_id, extra_caveats=None,
+                              duration_in_ms=(60 * 60 * 1000)):
         extra_caveats = extra_caveats or []
         macaroon = self._generate_base_macaroon(user_id)
         macaroon.add_first_party_caveat("type = access")
         now = self.hs.get_clock().time_msec()
-        expiry = now + (60 * 60 * 1000)
+        expiry = now + duration_in_ms
         macaroon.add_first_party_caveat("time < %d" % (expiry,))
         for caveat in extra_caveats:
             macaroon.add_first_party_caveat(caveat)
@@ -438,12 +705,17 @@ class AuthHandler(BaseHandler):
         ))
         return m.serialize()
 
-    def generate_short_term_login_token(self, user_id):
+    def generate_short_term_login_token(self, user_id, duration_in_ms=(2 * 60 * 1000)):
         macaroon = self._generate_base_macaroon(user_id)
         macaroon.add_first_party_caveat("type = login")
         now = self.hs.get_clock().time_msec()
-        expiry = now + (2 * 60 * 1000)
+        expiry = now + duration_in_ms
         macaroon.add_first_party_caveat("time < %d" % (expiry,))
+        return macaroon.serialize()
+
+    def generate_delete_pusher_token(self, user_id):
+        macaroon = self._generate_base_macaroon(user_id)
+        macaroon.add_first_party_caveat("type = delete_pusher")
         return macaroon.serialize()
 
     def validate_short_term_login_token_and_get_user_id(self, login_token):
@@ -480,7 +752,12 @@ class AuthHandler(BaseHandler):
 
         except_access_token_ids = [requester.access_token_id] if requester else []
 
-        yield self.store.user_set_password_hash(user_id, password_hash)
+        try:
+            yield self.store.user_set_password_hash(user_id, password_hash)
+        except StoreError as e:
+            if e.code == 404:
+                raise SynapseError(404, "Unknown user", Codes.NOT_FOUND)
+            raise e
         yield self.store.user_delete_access_tokens(
             user_id, except_access_token_ids
         )
@@ -520,7 +797,8 @@ class AuthHandler(BaseHandler):
         Returns:
             Hashed password (str).
         """
-        return bcrypt.hashpw(password, bcrypt.gensalt(self.bcrypt_rounds))
+        return bcrypt.hashpw(password + self.hs.config.password_pepper,
+                             bcrypt.gensalt(self.bcrypt_rounds))
 
     def validate_hash(self, password, stored_hash):
         """Validates that self.hash(password) == stored_hash.
@@ -532,4 +810,8 @@ class AuthHandler(BaseHandler):
         Returns:
             Whether self.hash(password) == stored_hash (bool).
         """
-        return bcrypt.hashpw(password, stored_hash) == stored_hash
+        if stored_hash:
+            return bcrypt.hashpw(password + self.hs.config.password_pepper,
+                                 stored_hash.encode('utf-8')) == stored_hash
+        else:
+            return False
